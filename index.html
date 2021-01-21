@@ -1,0 +1,56 @@
+<script src="https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js"></script>
+
+<script>
+    $(document).ready(function(){
+        $("#account-form>button[type=submit]").click(function(e){
+            e.preventDefault();
+
+            var apiGatewayInvokeURL = '';    <!--Add API Gateway Invoke URL-->
+            var body = {name : $("#name").val(), environment : $("#environment").val(),
+                        email : $("#email").val(), network: $("#network").val()};
+
+            $.ajax({
+                type: 'POST',
+                url : apiGatewayInvokeURL,
+                dataType: 'json',
+                crossDomain: 'true',
+                contentType: 'application/json; charset=utf-8',
+                data: JSON.stringify(body),
+
+                success: function () {
+                    $("#account-form").trigger('reset');
+                    alert('Success');
+                },
+                error: function (response) {
+                    alert('Failed: HTTP ' + response.status);
+                }
+            });
+        });
+    });
+</script>
+
+<link rel="stylesheet"
+ href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
+
+<form id="account-form" method="POST" action="/action_page.php">
+    <h3>Account Details</h3>
+    <div class="form-group">
+        <label for="name">Account full name</label>
+        <input id="name" type="text" class="form-control" name="name">
+    </div>
+    <div class="form-group">
+        <label for="environment">Environment (dev, test, prod)</label>
+        <input id="environment" type="text" class="form-control" name="environment">
+    </div>
+    <div class="form-group">
+        <label for="email">E-mail address</label>
+        <input id="email" type="email" class="form-control" name="email">
+    </div>
+    <div class="form-group">
+        <label for="network">Network type (private, public, hybrid)</label>
+        <input id="network" type="text" class="form-control" name="network">
+    </div>
+    <button type="submit" class="btn btn-primary">
+        <span>Submit</span>
+    </button>
+</form>

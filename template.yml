@@ -1,0 +1,462 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated AWS Account Creation web form, API Gateway, REST API, StateMachine and Lambda Functions'
+
+Parameters:
+  DeploymentStageName:
+    Type: String
+    MinLength: 1
+    Default: AccountCreation
+    Description: Path segment in the API Gateway Invoke URL.
+  ThrottlingRateLimit:
+    Type: Number
+    MinValue: 1
+    MaxValue: 100
+    Default: 1
+    Description: Number of allowed steady-state requests per second for the configured.
+      method.
+  ThrottlingBurstLimit:
+    Type: Number
+    MinValue: 1
+    MaxValue: 100
+    Default: 1
+    Description: Number of allowed burst requests per second.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: API Gateway Configuration
+      Parameters:
+      - DeploymentStageName
+      - ThrottlingRateLimit
+      - ThrottlingBurstLimit
+    ParameterLabels:
+      DeploymentStageName:
+        default: Stage Name
+      ThrottlingRateLimit:
+        default: Throttling Rate Limit
+      ThrottlingBurstLimit:
+        default: Throttling Burst Limit
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      WebsiteConfiguration:
+        IndexDocument: index.html
+    DeletionPolicy: Retain
+  AccountCreationApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    DependsOn: StartStateMachineExecutionFunction
+    Properties:
+      Name: account-creation-api
+      EndpointConfiguration:
+        Types:
+        - REGIONAL
+  AccountCreationApiGatewayMethodPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StartStateMachineExecutionFunction}/invocations
+      ResourceId:
+        Fn::GetAtt:
+        - AccountCreationApiGatewayRestApi
+        - RootResourceId
+      RestApiId:
+        Ref: AccountCreationApiGatewayRestApi
+  AccountCreationApiGatewayMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+        - ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+          StatusCode: '200'
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+      - ResponseModels:
+          application/json: Empty
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: true
+          method.response.header.Access-Control-Allow-Methods: true
+          method.response.header.Access-Control-Allow-Origin: true
+        StatusCode: '200'
+      ResourceId:
+        Fn::GetAtt:
+        - AccountCreationApiGatewayRestApi
+        - RootResourceId
+      RestApiId:
+        Ref: AccountCreationApiGatewayRestApi
+  FeedbackApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+    - AccountCreationApiGatewayMethodOptions
+    - AccountCreationApiGatewayRestApi
+    Properties:
+      RestApiId:
+        Ref: AccountCreationApiGatewayRestApi
+      StageName:
+        Ref: DeploymentStageName
+      StageDescription:
+        MethodSettings:
+        - ThrottlingRateLimit:
+            Ref: ThrottlingRateLimit
+          ThrottlingBurstLimit:
+            Ref: ThrottlingBurstLimit
+          ResourcePath: "/~1"
+          HttpMethod: POST
+          LoggingLevel: 'OFF'
+  StateMachineExecutionRoleForLambda:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      Path: "/"
+      Policies:
+        - PolicyName: StartStateMachineExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 'states:StartExecution'
+                Resource:
+                  - '*'
+                Effect: Allow
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  StartStateMachineExecutionFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - StateMachineExecutionRoleForLambda
+      - StateMachine
+    Properties:
+      Description: Trigger a State Machine with Submitted Form Data.
+      FunctionName: StartStateMachineExecution
+      Handler: index.lambda_handler
+      MemorySize: '128'
+      Role: !GetAtt StateMachineExecutionRoleForLambda.Arn
+      Runtime: python3.7
+      Timeout: '30'
+      ReservedConcurrentExecutions:
+        Ref: ThrottlingRateLimit
+      Code: {
+        "ZipFile": {
+            "Fn::Join": [
+                "\n",
+                [
+                    "import json",
+                    "import boto3",
+                    "",
+                    "client = boto3.client('stepfunctions')",
+                    "",
+                    "def lambda_handler(event, context):",
+                    "    # Form Data",
+                    "    body = json.loads(event['body']),",
+                    "",
+                    "    # Enable CORS",
+                    "    response = {'headers': {'Access-Control-Allow-Origin': '*'}}",
+                    "",
+                    "    # Start state machine execution",
+                    "    try:",
+                    {
+                      "Fn::Sub": [
+                          "        sfn_response = client.start_execution(stateMachineArn='${StateMachineArn}', input=json.dumps({'body':body}) )",
+                          {"StateMachineArn":{"Ref":"StateMachine"}}
+                      ],
+                    },
+                    "        # Generate response message for HTML web form submission",
+                    "        response['statusCode'] = sfn_response['ResponseMetadata']['HTTPStatusCode']",
+                    "        response['body'] = '{\"message\": \"Success\"}'",
+                    "    except Exception as e:",
+                    "        print(e)",
+                    "        response['statusCode'] = 500",
+                    "",
+                    "    return response",
+              ]
+            ]
+          }
+        }
+  StateMachineExecutionLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: StartStateMachineExecutionFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Sub: arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AccountCreationApiGatewayRestApi}/*/POST/
+  ParseFormDataAndGetCommitRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      Path: "/"
+      Policies:
+        - PolicyName: GetCommit
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 'codecommit:GetBranch'
+                Resource:
+                  - Fn::Sub: 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:aws-deployment-framework-bootstrap'
+                Effect: Allow
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  ParseFormDataAndGetCommitFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ParseFormDataAndGetCommitRole
+    Properties:
+      Description: Parses Submitted Form Data for Configuration File and Gets Latest Commit from CodeCommit Repository.
+      FunctionName: ParseFormDataAndGetCommit
+      Handler: index.lambda_handler
+      MemorySize: '128'
+      Role: !GetAtt ParseFormDataAndGetCommitRole.Arn
+      Runtime: python3.7
+      Timeout: '30'
+      ReservedConcurrentExecutions:
+        Ref: ThrottlingRateLimit
+      Code: {
+        ZipFile: {
+          Fn::Join: [
+              "\n",
+              [
+                  "import boto3",
+                  "",
+                  "client = boto3.client('codecommit')",
+                  "",
+                  "def lambda_handler(event, context):",
+                  "    # Parse form data from \"name\" field to alias for configuration file",
+                  "    alias_data = event['body'][0]['name']",
+                  "    alias = ' '.join(alias_data.split()).replace(' ', '-').replace('---', '-').lower()",
+                  "",
+                  "    # Parse form data as content for configuration file",
+                  "    data = '\\n\  - account_full_name: %s\\n\    organizational_unit_path: /\\n\    email: %s\\n\    allow_billing: True\\n\    delete_default_vpc: True\\n\    alias: %s\\n\    tags:\\n\      - networkType: %s\\n\ ' % (event['body'][0]['name'], event['body'][0]['email'], alias, event['body'][0]['network'])",
+                  "",
+                  "    # Get branch information from CodeCommit repository",
+                  "    parent_commit_id_value = client.get_branch(",
+                  "        repositoryName='aws-deployment-framework-bootstrap',",
+                  "        branchName='master'",
+                  "    )",
+                  "",
+                  "    # Parse parent commit id value from branch information",
+                  "    id = parent_commit_id_value['branch']['commitId']",
+                  "",
+                  "    return data, id",
+              ]
+            ]
+          }
+        }
+  GetFileRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      Path: "/"
+      Policies:
+        - PolicyName: GetFile
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 'codecommit:GetFile'
+                Resource:
+                  - Fn::Sub: 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:aws-deployment-framework-bootstrap'
+                Effect: Allow
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  GetFileFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: GetFileRole
+    Properties:
+      Description: Gets File Data from Configuration File in CodeCommit Repository.
+      FunctionName: GetFile
+      Handler: index.lambda_handler
+      MemorySize: '128'
+      Role: !GetAtt GetFileRole.Arn
+      Runtime: python3.7
+      Timeout: '30'
+      ReservedConcurrentExecutions:
+        Ref: ThrottlingRateLimit
+      Code: {
+        ZipFile: {
+          Fn::Join: [
+              "\n",
+              [
+                  "import json",
+                  "import boto3",
+                  "",
+                  "client = boto3.client('codecommit')",
+                  "",
+                  "def lambda_handler(event, context):",
+                  "    new_data = event[0::]",
+                  "",
+                  "    response = client.get_file(",
+                  "        repositoryName='aws-deployment-framework-bootstrap',",
+                  "        filePath='adf-accounts/account.yml'",
+                  "    )",
+                  "",
+                  "    file_data = response['fileContent'].decode('ascii')",
+                  "",
+                  "    return new_data, file_data",
+              ]
+          ]
+        }
+      }
+  CreateCommitRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      Path: "/"
+      Policies:
+        - PolicyName: PutFile
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 'codecommit:CreateCommit'
+                Resource:
+                  - Fn::Sub: 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:aws-deployment-framework-bootstrap'
+                Effect: Allow
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  CreateCommitFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CreateCommitRole
+    Properties:
+      Description: Puts Submitted Form Data to Configuration File in CodeCommit Repository.
+      FunctionName: CreateCommit
+      Handler: index.lambda_handler
+      MemorySize: '128'
+      Role: !GetAtt CreateCommitRole.Arn
+      Runtime: python3.7
+      Timeout: '30'
+      ReservedConcurrentExecutions:
+        Ref: ThrottlingRateLimit
+      Code: {
+        ZipFile: {
+          Fn::Join: [
+              "\n",
+              [
+                  "import boto3",
+                  "",
+                  "client = boto3.client('codecommit')",
+                  "",
+                  "def lambda_handler(event, context):",
+                  "    data = event[0::]",
+                  "    new_data = data[0][0]",
+                  "    file_data = data[1]",
+                  "    commit_data = file_data + new_data",
+                  "    commit_data_bytes = commit_data.encode('ascii')",
+                  "    commit_id = event[0][1]",
+                  "",
+                  "    # Create Commit to CodeCommit repository",
+                  "    response = client.create_commit(",
+                  "        repositoryName='aws-deployment-framework-bootstrap',",
+                  "        branchName='master',",
+                  "        parentCommitId=commit_id,",
+                  "        commitMessage='added new account details',",
+                  "        putFiles=[",
+                  "            {",
+                  "                'filePath': 'adf-accounts/account.yml',",
+                  "                'fileContent': commit_data_bytes",
+                  "             },",
+                  "        ]",
+                  "    )",
+                  "",
+                  "    return response",
+            ]
+          ]
+        }
+      }
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+             Service: states.amazonaws.com
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn:
+      - StateMachineRole
+      - ParseFormDataAndGetCommitFunction
+      - CreateCommitFunction
+    Properties:
+      DefinitionString:
+        Fn::Sub: |
+            {
+              "Comment": "State Machine for parsing the data from Web Form and sending it to CodeCommit repository",
+              "StartAt": "ParseFormDataAndGetCommit",
+              "States": {
+                "ParseFormDataAndGetCommit": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ParseFormDataAndGetCommitFunction}",
+                  "Next": "GetFile"
+                },
+                "GetFile": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${GetFileFunction}",
+                  "Next": "CreateCommit"
+                },
+                "CreateCommit": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${CreateCommitFunction}",
+                  "End": true
+                }
+              }
+            }
+      RoleArn: !GetAtt StateMachineRole.Arn
+Outputs:
+  ApiGatewayInvokeURL:
+    Value:
+      Fn::Sub: https://${AccountCreationApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${DeploymentStageName}
